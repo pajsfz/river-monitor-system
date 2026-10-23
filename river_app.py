@@ -20,6 +20,8 @@ import streamlit as st
 from PIL import Image, ImageOps
 
 from river_monitor import ModelRuntime, process_video, summarize
+from river_batch import batch_results_zip, detect_image_batch
+from river_gallery import render_image_gallery
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_MODEL = ROOT / "runs" / "train" / "river_yolo" / "weights" / "best.pt"
@@ -285,6 +287,8 @@ footer { visibility:hidden; }
     )
     st.session_state.setdefault("deepseek_text", "")
     st.session_state.setdefault("deepseek_review_count", 0)
+    st.session_state.setdefault("image_results", [])
+    st.session_state.setdefault("image_index", 0)
 
     with st.sidebar:
         st.markdown("<div style='font-size:1.15rem;font-weight:800'>:material/water: RIVER SENTINEL</div>", unsafe_allow_html=True)
@@ -348,15 +352,8 @@ def render_overview() -> None:
             st.caption("真实验证集样例，仅用于查看训练数据；不是现场监控画面，也未叠加模拟检测框。")
             st.image(Image.open(DEMO_IMAGE), alt="训练数据集中的真实验证集图片", width="stretch")
     elif result["kind"] == "图片":
-        left, right = st.columns([1.5, 1], gap="large")
-        left.image(result["annotated_image"], caption=result["source_name"], alt="YOLO 图片检测标注结果", width="stretch")
-        if summary["分类统计"]:
-            right.dataframe(
-                pd.DataFrame([{"类别": k, "检测框数": v} for k, v in summary["分类统计"].items()]),
-                hide_index=True, alt="图片检测类别统计"
-            )
-        else:
-            right.success("当前图片未检出目标。")
+        results = st.session_state.image_results or [result]
+        render_image_gallery(results, "overview")
     else:
         video_path = Path(result["annotated_video"])
         if video_path.is_file():
@@ -369,37 +366,70 @@ def render_overview() -> None:
 
 def render_detection() -> None:
     st.markdown("<div class='section-title'>上传并识别</div>", unsafe_allow_html=True)
-    st.caption("图片检测整张画面；视频逐帧检测全部可读取画面。摄像头暂未接入。")
-    model_default = ""
-    with st.form("detection_form", border=False):
-        uploaded = st.file_uploader(
-            "上传河道图片或视频",
-            type=["jpg", "jpeg", "png", "bmp", "webp", "mp4", "mov", "avi", "mkv", "m4v"],
-        )
-        model_text = st.text_input("其他 YOLO 权重路径（留空自动使用最近训练的模型）", value=model_default, help="PyCharm 新训练后会自动选择 runs/train 下最新的 weights/best.pt。")
-        confidence = st.slider("置信度阈值", 0.05, 0.95, 0.25, 0.05)
-        run_detection = st.form_submit_button("开始 YOLO 检测", type="primary", icon=":material/search:")
+    st.caption("支持批量图片逐张标框，也支持单个视频逐帧检测。摄像头暂未接入。")
+    upload_mode = st.segmented_control("上传类型", ["批量图片", "单个视频"], default="批量图片", key="upload_mode")
+    model_text = st.text_input("其他 YOLO 权重路径（留空自动使用最近训练的模型）", value="", help="PyCharm 新训练后会自动选择 runs/train 下最新的 weights/best.pt。")
+    confidence = st.slider("置信度阈值", 0.05, 0.95, 0.25, 0.05)
+    image_types = ["jpg", "jpeg", "png", "bmp", "webp"]
+    video_types = ["mp4", "mov", "avi", "mkv", "m4v"]
+    uploaded_files = st.file_uploader(
+        "批量选择河道图片" if upload_mode == "批量图片" else "上传河道视频",
+        type=image_types if upload_mode == "批量图片" else video_types,
+        accept_multiple_files=upload_mode == "批量图片",
+        max_upload_size=200,
+        key=f"upload_{upload_mode}",
+    )
+    run_detection = st.button("开始 YOLO 检测", type="primary", icon=":material/search:")
 
+    files = uploaded_files if isinstance(uploaded_files, list) else ([uploaded_files] if uploaded_files else [])
     if run_detection:
-        if uploaded is None:
-            st.error("请先上传图片或视频。")
+        if upload_mode == "批量图片" and files:
+            st.session_state.image_results = []
+            st.session_state.image_index = 0
+            st.session_state.result = {
+                "kind": "", "source_name": "", "created_at": "", "frame_count": 0,
+                "detections": [], "annotated_image": b"", "vision_frames": [], "annotated_video": "",
+            }
+            st.session_state.deepseek_text = ""
+        if not files:
+            st.error("请先选择要检测的文件。")
+        elif upload_mode == "批量图片" and len(files) > 50:
+            st.error("单批最多上传 50 张图片，请分批检测。")
+        elif upload_mode == "批量图片" and sum(item.size for item in files) > 200 * 1024 * 1024:
+            st.error("单批图片总大小不能超过 200 MB，请分批检测。")
         else:
             model_path = resolve_model_path(model_text.strip()) if model_text.strip() else discover_model_path()
             if not model_path.is_file():
                 st.error(f"没有找到模型权重：{model_path}")
             else:
                 try:
-                    with st.spinner("正在读取文件并运行 YOLO…"):
-                        data = uploaded.getvalue()
-                        if uploaded.type.startswith("image/"):
-                            result = detect_image(data, uploaded.name, model_path, confidence)
-                        else:
+                    if upload_mode == "批量图片":
+                        progress = st.progress(0.0, text="准备批量检测…")
+                        with st.spinner("正在逐张运行 YOLO…"):
+                            image_results, errors = detect_image_batch(
+                                [(item.name, item.getvalue()) for item in files], detect_image, model_path, confidence,
+                                lambda current, total: progress.progress(current / total, text=f"批量检测中：{current} / {total} 张"),
+                            )
+                        if image_results:
+                            st.session_state.image_results = image_results
+                            st.session_state.image_index = 0
+                            st.session_state.result = image_results[0]
+                            st.session_state.deepseek_text = ""
+                            st.success(f"批量检测完成：成功 {len(image_results)} 张，失败 {len(errors)} 张。")
+                        elif errors:
+                            st.error("这批图片都未能处理。")
+                        for error in errors:
+                            st.warning(error)
+                    else:
+                        uploaded = files[0]
+                        st.session_state.image_results = []
+                        with st.spinner("正在运行 YOLO 视频检测…"):
                             progress = st.progress(0.0, text="正在准备视频检测…")
                             progress_note = st.empty()
-                            result = detect_video(data, uploaded.name, model_path, confidence, progress, progress_note)
-                    st.session_state.result = result
-                    st.session_state.deepseek_text = ""
-                    st.success("检测处理完成。")
+                            result = detect_video(uploaded.getvalue(), uploaded.name, model_path, confidence, progress, progress_note)
+                        st.session_state.result = result
+                        st.session_state.deepseek_text = ""
+                        st.success("视频检测处理完成。")
                 except Exception as exc:
                     st.error(f"检测失败：{type(exc).__name__}: {exc}")
 
@@ -414,19 +444,26 @@ def render_detection() -> None:
         m3.metric("平均置信度", f"{summary['平均置信度']:.1%}" if summary["平均置信度"] is not None else "无目标")
         st.caption(f"{result['source_name']} · {result['created_at']}")
         if result["kind"] == "图片":
-            left, right = st.columns([1.5, 1], gap="large")
-            left.image(result["annotated_image"], alt="带 YOLO 检测框的图片", width="stretch")
+            results = st.session_state.image_results or [result]
+            selected = render_image_gallery(results, "detection")
+            summary = summarize(selected["detections"])
             if summary["分类统计"]:
-                right.dataframe(
+                st.dataframe(
                     pd.DataFrame([{"类别": k, "检测框数": v} for k, v in summary["分类统计"].items()]),
-                    hide_index=True, alt="图片检测类别统计"
+                    hide_index=True, alt="当前图片类别统计"
                 )
             else:
-                right.success("当前图片未检出达到阈值的目标。")
+                st.success("当前图片未检出达到阈值的目标。")
             st.download_button(
-                "下载标注图片", result["annotated_image"], f"annotated_{Path(result['source_name']).stem}.png",
+                "下载当前标注图片", selected["annotated_image"],
+                f"annotated_{Path(selected['source_name']).stem}.png",
                 "image/png", icon=":material/download:"
             )
+            if len(results) > 1:
+                st.download_button(
+                    "下载整批标注图片和 CSV", batch_results_zip(results),
+                    "river_annotated_batch.zip", "application/zip", icon=":material/archive:"
+                )
         else:
             video_path = Path(result["annotated_video"])
             if video_path.is_file():
@@ -466,6 +503,18 @@ def render_detection() -> None:
 
 
 def render_records() -> None:
+    if st.session_state.image_results:
+        results = st.session_state.image_results
+        index = min(st.session_state.image_index, len(results) - 1)
+        result = results[index]
+        summary = summarize(result["detections"])
+        st.caption(f"批量图片 {index + 1} / {len(results)}")
+        st.write(f"**图片** · {result['source_name']} · {result['created_at']}")
+        st.write(f"检测框 {summary['目标框总数']:,} 个。")
+        render_image_gallery(results, "records")
+        st.dataframe(pd.DataFrame(result["detections"]), hide_index=True, alt="当前图片检测明细")
+        st.download_button("下载整批标注图片和 CSV", batch_results_zip(results), "river_annotated_batch.zip", "application/zip")
+        return
     st.markdown("<div class='section-title'>当前会话检测记录</div>", unsafe_allow_html=True)
     result = st.session_state.result
     if not result["kind"]:
