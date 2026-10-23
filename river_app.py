@@ -5,8 +5,11 @@ import io
 import json
 import os
 import re
+import base64
 from datetime import datetime
+from datetime import date
 from pathlib import Path
+from threading import Lock
 
 import cv2
 import imageio_ffmpeg
@@ -23,6 +26,10 @@ DEFAULT_MODEL = ROOT / "runs" / "train" / "river_yolo" / "weights" / "best.pt"
 DEMO_IMAGE = ROOT / "datasets" / "river_debris" / "images" / "val" / "000004.jpg"
 OUTPUT_DIR = ROOT / "runs" / "processed"
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DEEPSEEK_DAILY_LIMIT = 20
+_deepseek_usage_lock = Lock()
+_deepseek_usage_date = date.today()
+_deepseek_usage_count = 0
 
 
 def resolve_model_path(raw_path: str) -> Path:
@@ -58,7 +65,60 @@ def csv_bytes(rows: list[dict]) -> bytes:
     return pd.DataFrame(rows).to_csv(index=False).encode("utf-8-sig")
 
 
-def deepseek_analysis(api_key: str, model: str, result: dict) -> str:
+def deepseek_api_key() -> str:
+    key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+    try:
+        return str(st.secrets.get("DEEPSEEK_API_KEY", key)).strip()
+    except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
+        return key
+
+
+def reserve_deepseek_review() -> bool:
+    global _deepseek_usage_count, _deepseek_usage_date
+    with _deepseek_usage_lock:
+        today = date.today()
+        if today != _deepseek_usage_date:
+            _deepseek_usage_date = today
+            _deepseek_usage_count = 0
+        if _deepseek_usage_count >= DEEPSEEK_DAILY_LIMIT:
+            return False
+        _deepseek_usage_count += 1
+        return True
+
+
+def prepare_vision_image(data: bytes, max_side: int = 1280) -> bytes:
+    image = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=78, optimize=True)
+    return output.getvalue()
+
+
+def sample_video_frames(video_path: Path, frame_count: int, fps: float, limit: int = 4) -> list[dict]:
+    capture = cv2.VideoCapture(str(video_path))
+    samples = []
+    try:
+        if not capture.isOpened():
+            return samples
+        indices = np.linspace(0, max(frame_count - 1, 0), min(limit, frame_count), dtype=int)
+        for index in np.unique(indices):
+            capture.set(cv2.CAP_PROP_POS_FRAMES, int(index))
+            ok, frame = capture.read()
+            if not ok:
+                continue
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            image = Image.fromarray(rgb)
+            image.thumbnail((1280, 1280), Image.Resampling.LANCZOS)
+            output = io.BytesIO()
+            image.save(output, format="JPEG", quality=78, optimize=True)
+            seconds = index / fps if fps > 0 else 0.0
+            samples.append({"label": f"{seconds:.1f} 秒", "data": output.getvalue()})
+    finally:
+        capture.release()
+    return samples
+
+
+def deepseek_analysis(api_key: str, result: dict) -> str:
     detections = result["detections"]
     summary = summarize(detections)
     counts_by_frame: dict[int, int] = {}
@@ -70,29 +130,59 @@ def deepseek_analysis(api_key: str, model: str, result: dict) -> str:
         "文件名": result["source_name"],
         "处理帧数": result["frame_count"],
         "检测框总数": summary["目标框总数"],
-        "各类别检测框累计数": summary["分类统计"],
-        "平均置信度": summary["平均置信度"],
+        "YOLO各类别检测框累计数": summary["分类统计"],
+        "YOLO平均置信度": summary["平均置信度"],
         "单帧最高检测框数": max(counts_by_frame.values(), default=0),
     }
+    vision_frames = result.get("vision_frames", [])
+    payload["视觉复核图片"] = [sample["label"] for sample in vision_frames]
+    vision_content = []
+    for sample in vision_frames:
+        encoded = base64.b64encode(sample["data"]).decode("ascii")
+        vision_content.append({"type": "text", "text": f"请独立观察这张河道画面，时间位置：{sample['label']}。"})
+        vision_content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{encoded}"}})
+    vision_response = requests.post(
+        "https://api.deepseek.com/chat/completions",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        json={
+            "model": "deepseek-flash",
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": "只根据图片直接观察可见物体、位置、外观和不确定性；不要假设任何检测模型的结果，不推断水质或水位。"},
+                {"role": "user", "content": vision_content},
+            ],
+        },
+        timeout=90,
+    )
+    vision_response.raise_for_status()
+    independent_observation = vision_response.json()["choices"][0]["message"]["content"]
+    comparison_payload = {"YOLO统计": payload, "DeepSeek独立视觉观察": independent_observation}
     response = requests.post(
         "https://api.deepseek.com/chat/completions",
         headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
         json={
-            "model": model,
+            "model": "deepseek-flash",
             "temperature": 0.2,
             "messages": [
                 {
                     "role": "system",
                     "content": (
-                        "你是河道漂浮物巡查分析助手。只解释所给 YOLO 类别统计、数量、置信度和处理范围；"
-                        "不得推断水位、水质、水量或未提供的现场信息。视频框数是跨帧累计，不是去重物体数。"
-                        "提醒人工复核，不要声称已经派发告警。用中文给出简明结论和建议。"
+                        "你是河道漂浮物视觉复核助手。依据图片独立观察后再核对 YOLO 统计；视觉判断是辅助意见，"
+                        "不能替代人工标注或正式模型评估。只讨论可见画面，不推断水质、水位、水量或画面外事实。"
                     ),
                 },
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+                {
+                    "role": "user",
+                    "content": (
+                        "请比较独立视觉观察与 YOLO 统计，指出可能漏检、误检或类别不一致，并说明不确定性。"
+                        "针对漂浮物数据集给出可执行的补充采集、人工标注和复训建议。视频抽样帧对象数不代表整段视频去重数。"
+                        "不要推断水质、水位、水量，不要声称已修改模型。按‘独立观察、与 YOLO 对照、数据集改进建议、人工复核事项’用中文简洁作答。\n"
+                        f"{json.dumps(comparison_payload, ensure_ascii=False)}"
+                    ),
+                }
             ],
         },
-        timeout=60,
+        timeout=90,
     )
     response.raise_for_status()
     return response.json()["choices"][0]["message"]["content"]
@@ -112,6 +202,7 @@ def detect_image(data: bytes, filename: str, model_path: Path, confidence: float
         "frame_count": 1,
         "detections": [{"帧序号": 1, "时间(秒)": 0.0, **item} for item in detections],
         "annotated_image": encoded.tobytes(),
+        "vision_frames": [{"label": "整张上传图片", "data": prepare_vision_image(data)}],
         "annotated_video": "",
     }
 
@@ -140,6 +231,7 @@ def detect_video(data: bytes, filename: str, model_path: Path, confidence: float
         detections, frame_count, fps = process_video(
             input_path, output_path, runtime, confidence, imageio_ffmpeg.get_ffmpeg_exe(), update
         )
+        vision_frames = sample_video_frames(input_path, frame_count, fps)
     finally:
         input_path.unlink(missing_ok=True)
     return {
@@ -150,6 +242,7 @@ def detect_video(data: bytes, filename: str, model_path: Path, confidence: float
         "fps": fps,
         "detections": detections,
         "annotated_image": b"",
+        "vision_frames": vision_frames,
         "annotated_video": str(output_path),
     }
 
@@ -188,10 +281,10 @@ footer { visibility:hidden; }
     st.session_state.setdefault(
         "result",
         {"kind": "", "source_name": "", "created_at": "", "frame_count": 0,
-         "detections": [], "annotated_image": b"", "annotated_video": ""},
+         "detections": [], "annotated_image": b"", "vision_frames": [], "annotated_video": ""},
     )
     st.session_state.setdefault("deepseek_text", "")
-    st.session_state.setdefault("deepseek_error", "")
+    st.session_state.setdefault("deepseek_review_count", 0)
 
     with st.sidebar:
         st.markdown("<div style='font-size:1.15rem;font-weight:800'>:material/water: RIVER SENTINEL</div>", unsafe_allow_html=True)
@@ -212,7 +305,7 @@ footer { visibility:hidden; }
     st.markdown(
         "<div class='hero'><div class='eyebrow'>RIVER DEBRIS INSPECTION</div>"
         "<h1>河道漂浮物监测平台</h1>"
-        "<p>使用项目训练得到的 YOLO 权重识别漂浮垃圾；DeepSeek 根据检测统计辅助整理结果。</p></div>",
+        "<p>YOLO 识别漂浮物；DeepSeek 独立观察画面并与检测结果交叉复核。</p></div>",
         unsafe_allow_html=True,
     )
 
@@ -270,10 +363,8 @@ def render_overview() -> None:
             st.video(video_path, alt="YOLO 逐帧标注后的视频")
         else:
             st.warning("标注视频已不存在，请重新处理。")
-    if exists and st.session_state.deepseek_text:
-        st.markdown("#### DeepSeek 分析")
-        st.markdown(st.session_state.deepseek_text)
-        st.caption("依据 YOLO 检测统计生成，不是 DeepSeek 独立看图识别。")
+    if exists:
+        render_deepseek_review(result, "overview")
 
 
 def render_detection() -> None:
@@ -308,7 +399,6 @@ def render_detection() -> None:
                             result = detect_video(data, uploaded.name, model_path, confidence, progress, progress_note)
                     st.session_state.result = result
                     st.session_state.deepseek_text = ""
-                    st.session_state.deepseek_error = ""
                     st.success("检测处理完成。")
                 except Exception as exc:
                     st.error(f"检测失败：{type(exc).__name__}: {exc}")
@@ -317,6 +407,7 @@ def render_detection() -> None:
     if result["kind"]:
         summary = summarize(result["detections"])
         st.markdown("<div class='section-title'>检测结果</div>", unsafe_allow_html=True)
+        st.caption("DeepSeek 可独立观察上传原图，再与 YOLO 统计交叉复核；运行复核会将图片发送到 DeepSeek API。")
         m1, m2, m3 = st.columns(3)
         m1.metric("处理帧数", f"{result['frame_count']:,}")
         m2.metric("检测框累计", f"{summary['目标框总数']:,}")
@@ -355,9 +446,7 @@ def render_detection() -> None:
             )
         else:
             st.info("本次已完成真实模型推理，但没有符合阈值的目标。")
-        if st.session_state.deepseek_text:
-            st.markdown("#### DeepSeek 分析")
-            st.markdown(st.session_state.deepseek_text)
+        render_deepseek_review(result, "detection")
     elif DEMO_IMAGE.is_file():
         st.markdown("<div class='section-title'>真实验证集样例</div>", unsafe_allow_html=True)
         st.caption("这张图来自训练集验证集；点击按钮将实际调用 best.pt 推理，不会展示模拟检测框。")
@@ -392,41 +481,48 @@ def render_records() -> None:
     else:
         st.info("本次推理没有检出目标。")
 
+def render_deepseek_review(result: dict, key_suffix: str) -> None:
+    st.markdown("#### DeepSeek 独立视觉复核")
+    st.caption("DeepSeek 先单独观察画面，再与 YOLO 结果交叉对照；视频最多复核 4 张抽样帧。意见仅供人工确认，不会自动改写 YOLO 权重。")
+    api_key = deepseek_api_key()
+    if not result.get("vision_frames"):
+        st.warning("本次任务没有可发送的视觉抽样帧。")
+        return
+    if not api_key:
+        st.info("管理员尚未配置 DeepSeek 服务密钥；YOLO 检测可正常使用。")
+        return
+    if st.session_state.deepseek_review_count >= 3:
+        st.warning("本会话最多运行 3 次 DeepSeek 视觉复核，以控制共享 API 额度。")
+        return
+    if st.button("运行 DeepSeek 图片复核", type="primary", icon=":material/visibility:", key=f"deepseek_review_{key_suffix}"):
+        if not reserve_deepseek_review():
+            st.warning(f"当前服务实例今日的 DeepSeek 视觉复核额度已达到 {DEEPSEEK_DAILY_LIMIT} 次。")
+            return
+        try:
+            with st.spinner("DeepSeek 正在独立观察画面并对照 YOLO 结果…"):
+                st.session_state.deepseek_review_count += 1
+                st.session_state.deepseek_text = deepseek_analysis(api_key, result)
+            st.success("视觉复核完成。")
+        except requests.RequestException as exc:
+            status = exc.response.status_code if exc.response is not None else "网络连接错误"
+            st.error(f"DeepSeek 请求失败（{status}）。请管理员检查 API 配额、密钥和网络。")
+        except (KeyError, ValueError, TypeError) as exc:
+            st.error(f"DeepSeek 返回内容无法解析：{exc}")
+    if st.session_state.get("deepseek_text"):
+        st.markdown(st.session_state.deepseek_text)
+
+
 
 def render_settings() -> None:
     st.markdown("<div class='section-title'>系统设置</div>", unsafe_allow_html=True)
     st.markdown("#### DeepSeek 分析")
-    st.caption("DeepSeek 使用 YOLO 类别统计整理结论，不会独立识别上传的画面。")
-    default_key = os.getenv("DEEPSEEK_API_KEY", "")
-    try:
-        default_key = st.secrets.get("DEEPSEEK_API_KEY", default_key)
-    except (FileNotFoundError, st.errors.StreamlitSecretNotFoundError):
-        pass
-    key = st.text_input("DeepSeek API Key", value=default_key, type="password", help="仅用于本次请求，不写入项目文件。")
-    model = st.selectbox("分析模型", ["deepseek-chat", "deepseek-reasoner"])
-    result = st.session_state.result
-    if result["kind"]:
-        stats = summarize(result["detections"])
-        st.write(f"当前任务：{result['kind']} · {result['source_name']} · {stats['目标框总数']} 个检测框")
-        if st.button("分析最近一次 YOLO 结果", type="primary", icon=":material/psychology:"):
-            if not key.strip():
-                st.error("请填写 DeepSeek API Key。")
-            else:
-                try:
-                    with st.spinner("正在请求 DeepSeek…"):
-                        st.session_state.deepseek_text = deepseek_analysis(key.strip(), model, result)
-                    st.session_state.deepseek_error = ""
-                    st.success("分析完成。")
-                except requests.RequestException as exc:
-                    st.session_state.deepseek_error = str(exc)
-                    st.error(f"DeepSeek 请求失败：{exc}")
-                except (KeyError, ValueError, TypeError) as exc:
-                    st.session_state.deepseek_error = str(exc)
-                    st.error(f"DeepSeek 返回内容无法解析：{exc}")
-        if st.session_state.deepseek_text:
-            st.markdown(st.session_state.deepseek_text)
+    st.caption("密钥仅由管理员配置在服务器端；访问者不能查看或输入共享密钥。视觉复核会将上传图片发送给 DeepSeek。")
+    if deepseek_api_key():
+        st.success("服务器端 DeepSeek 密钥已配置")
     else:
-        st.info("先上传图片或视频运行 YOLO。")
+        st.warning("尚未配置服务器端 DEEPSEEK_API_KEY；本地可设置环境变量，云端请由管理员设置 Streamlit Secret。")
+    st.caption("使用支持视觉输入的 deepseek-flash 模型，读取原始图片并与 YOLO 检测结果进行交叉核对。")
+    st.info("视觉复核可提示可能漏检、误检并提出补充标注建议；真正提升模型识别度仍需人工核验、补充标注并重新训练。")
     st.divider()
     st.markdown("#### 训练权重")
     model_path = discover_model_path()
